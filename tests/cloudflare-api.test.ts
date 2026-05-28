@@ -1,7 +1,7 @@
 /**
  * Direct tests for the CloudflareApi client — independent of the
  * orchestrator. Covers HTTP envelope unwrapping, auth header injection,
- * and error mapping.
+ * and the WfP-specific endpoints.
  */
 import { describe, expect, it } from "vitest";
 import {
@@ -30,7 +30,7 @@ function envelope(body: object, status = 200): Response {
 	});
 }
 
-describe("CloudflareApi", () => {
+describe("CloudflareApi — common", () => {
 	it("sends the bearer token on every request", async () => {
 		const { fetch, calls } = makeFakeFetch(() =>
 			envelope({
@@ -49,28 +49,6 @@ describe("CloudflareApi", () => {
 		expect(calls).toHaveLength(1);
 		const headers = new Headers(calls[0]!.init.headers);
 		expect(headers.get("Authorization")).toBe("Bearer secret-token");
-	});
-
-	it("targets the correct path for createD1Database", async () => {
-		const { fetch, calls } = makeFakeFetch(() =>
-			envelope({
-				success: true,
-				result: { uuid: "u", name: "n", created_at: "" },
-				errors: [],
-				messages: [],
-			}),
-		);
-		const api = new CloudflareApi({
-			apiToken: "t",
-			accountId: "acct-123",
-			fetch,
-		});
-		await api.createD1Database("my-db");
-		expect(calls[0]!.url).toBe(
-			"https://api.cloudflare.com/client/v4/accounts/acct-123/d1/database",
-		);
-		expect(calls[0]!.init.method).toBe("POST");
-		expect(JSON.parse(calls[0]!.init.body as string)).toEqual({ name: "my-db" });
 	});
 
 	it("unwraps the result on success", async () => {
@@ -124,10 +102,42 @@ describe("CloudflareApi", () => {
 		expect(err).toBeInstanceOf(CloudflareApiError);
 		expect((err as CloudflareApiError).status).toBe(502);
 	});
+});
 
-	it("uploadWorker sends multipart with metadata and script parts", async () => {
-		const captured: { metadata?: string; scriptBody?: string } = {};
-		const { fetch } = makeFakeFetch(async (_url, init) => {
+describe("CloudflareApi — Workers for Platforms", () => {
+	it("createDispatchNamespace targets the right endpoint", async () => {
+		const { fetch, calls } = makeFakeFetch(() =>
+			envelope({
+				success: true,
+				result: {
+					namespace_id: "ns-1",
+					namespace_name: "skribb-tenants",
+					created_on: "2026-05-28T00:00:00Z",
+				},
+				errors: [],
+				messages: [],
+			}),
+		);
+		const api = new CloudflareApi({
+			apiToken: "t",
+			accountId: "acct-123",
+			fetch,
+		});
+		const ns = await api.createDispatchNamespace("skribb-tenants");
+		expect(calls[0]!.url).toBe(
+			"https://api.cloudflare.com/client/v4/accounts/acct-123/workers/dispatch/namespaces",
+		);
+		expect(calls[0]!.init.method).toBe("POST");
+		expect(JSON.parse(calls[0]!.init.body as string)).toEqual({
+			name: "skribb-tenants",
+		});
+		expect(ns.namespace_id).toBe("ns-1");
+	});
+
+	it("uploadNamespaceScript targets the right endpoint and sends multipart", async () => {
+		const captured: { metadata?: string; scriptBody?: string; url?: string } = {};
+		const { fetch } = makeFakeFetch(async (url, init) => {
+			captured.url = url;
 			const form = init.body as FormData;
 			const metaPart = form.get("metadata") as Blob;
 			captured.metadata = await metaPart.text();
@@ -136,42 +146,54 @@ describe("CloudflareApi", () => {
 			return envelope({ success: true, result: null, errors: [], messages: [] });
 		});
 		const api = new CloudflareApi({ apiToken: "t", accountId: "a", fetch });
-		await api.uploadWorker({
-			scriptName: "worker-x",
+		await api.uploadNamespaceScript({
+			namespace: "skribb-tenants",
+			scriptName: "skribb-cms-alice",
 			scriptBody: "export default {}",
 			compatibilityDate: "2026-05-01",
 			compatibilityFlags: ["nodejs_compat"],
 			bindings: [{ type: "d1", name: "DB", id: "d1-x" }],
+			tags: ["emdash-version:0.14.0"],
 		});
+		expect(captured.url).toBe(
+			"https://api.cloudflare.com/client/v4/accounts/a/workers/dispatch/namespaces/skribb-tenants/scripts/skribb-cms-alice",
+		);
 		const meta = JSON.parse(captured.metadata!) as Record<string, unknown>;
 		expect(meta.main_module).toBe("worker.js");
 		expect(meta.compatibility_date).toBe("2026-05-01");
 		expect(meta.compatibility_flags).toEqual(["nodejs_compat"]);
+		expect(meta.tags).toEqual(["emdash-version:0.14.0"]);
 		expect(meta.bindings).toEqual([{ type: "d1", name: "DB", id: "d1-x" }]);
 		expect(captured.scriptBody).toBe("export default {}");
 	});
 
-	it("bindWorkerCustomDomain returns the domain id for cleanup", async () => {
-		const { fetch } = makeFakeFetch(() =>
-			envelope({
-				success: true,
-				result: {
-					id: "dom-99",
-					zone_id: "z",
-					hostname: "h",
-					service: "s",
-					environment: "production",
-				},
-				errors: [],
-				messages: [],
-			}),
+	it("URL-encodes special characters in namespace + script names", async () => {
+		const { fetch, calls } = makeFakeFetch(() =>
+			envelope({ success: true, result: null, errors: [], messages: [] }),
 		);
 		const api = new CloudflareApi({ apiToken: "t", accountId: "a", fetch });
-		const domain = await api.bindWorkerCustomDomain({
-			scriptName: "s",
-			hostname: "alice.cms.skribb.no",
-			zoneId: "z",
+		await api.uploadNamespaceScript({
+			namespace: "a/b",
+			scriptName: "x y",
+			scriptBody: "",
+			compatibilityDate: "2026-01-01",
+			bindings: [],
 		});
-		expect(domain.id).toBe("dom-99");
+		expect(calls[0]!.url).toContain("/namespaces/a%2Fb/scripts/x%20y");
+	});
+
+	it("deleteNamespaceScript targets the right endpoint", async () => {
+		const { fetch, calls } = makeFakeFetch(() =>
+			envelope({ success: true, result: null, errors: [], messages: [] }),
+		);
+		const api = new CloudflareApi({ apiToken: "t", accountId: "a", fetch });
+		await api.deleteNamespaceScript({
+			namespace: "skribb-tenants",
+			scriptName: "skribb-cms-alice",
+		});
+		expect(calls[0]!.init.method).toBe("DELETE");
+		expect(calls[0]!.url).toContain(
+			"/workers/dispatch/namespaces/skribb-tenants/scripts/skribb-cms-alice",
+		);
 	});
 });

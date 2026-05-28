@@ -19,19 +19,14 @@ import type {
 	TenantStore,
 } from "../src/types.js";
 
-interface CapturedWorker {
+interface CapturedScript {
+	namespace: string;
 	scriptName: string;
 	scriptBody: string;
 	bindings: Array<Record<string, unknown>>;
 	compatibilityDate: string;
 	compatibilityFlags: string[];
-}
-
-interface CapturedDomain {
-	scriptName: string;
-	hostname: string;
-	zoneId: string;
-	domainId: string;
+	tags?: string[];
 }
 
 export interface MockCloudflareApi {
@@ -39,12 +34,12 @@ export interface MockCloudflareApi {
 	state: {
 		createdDatabases: Array<{ uuid: string; name: string }>;
 		createdBuckets: Array<{ name: string }>;
-		uploadedWorkers: CapturedWorker[];
-		boundDomains: CapturedDomain[];
+		createdNamespaces: Array<{ name: string }>;
+		uploadedScripts: CapturedScript[];
 	};
 	/** Inject a one-shot failure on the next call matching `method + urlContains`. */
 	failNext(method: string, urlContains: string, errorMessage: string): void;
-	/** Total fetch calls observed — sanity for "called once per step" assertions. */
+	/** Total fetch calls observed. */
 	callCount(): number;
 }
 
@@ -52,8 +47,8 @@ export function makeMockCloudflareApi(): MockCloudflareApi {
 	const state: MockCloudflareApi["state"] = {
 		createdDatabases: [],
 		createdBuckets: [],
-		uploadedWorkers: [],
-		boundDomains: [],
+		createdNamespaces: [],
+		uploadedScripts: [],
 	};
 	let calls = 0;
 	const failures: Array<{
@@ -102,11 +97,33 @@ export function makeMockCloudflareApi(): MockCloudflareApi {
 			return envelope(true, { name: body.name });
 		}
 
-		// Worker script upload (PUT with multipart body).
-		if (method === "PUT" && url.includes("/workers/scripts/")) {
-			const scriptName = decodeURIComponent(
-				url.split("/workers/scripts/")[1] ?? "",
-			);
+		// Dispatch namespace create.
+		if (
+			method === "POST" &&
+			url.includes("/workers/dispatch/namespaces") &&
+			!url.includes("/scripts/")
+		) {
+			const body = JSON.parse(init?.body as string) as { name: string };
+			state.createdNamespaces.push({ name: body.name });
+			return envelope(true, {
+				namespace_id: `ns-${state.createdNamespaces.length}`,
+				namespace_name: body.name,
+				created_on: "2026-05-28T00:00:00Z",
+			});
+		}
+
+		// Namespace script upload (PUT with multipart body).
+		if (
+			method === "PUT" &&
+			url.includes("/workers/dispatch/namespaces/") &&
+			url.includes("/scripts/")
+		) {
+			// Path: .../namespaces/{ns}/scripts/{script}
+			const segments = url.split("/");
+			const nsIdx = segments.indexOf("namespaces");
+			const namespace = decodeURIComponent(segments[nsIdx + 1] ?? "");
+			const scriptIdx = segments.indexOf("scripts");
+			const scriptName = decodeURIComponent(segments[scriptIdx + 1] ?? "");
 			const form = init?.body as FormData;
 			const metadataPart = form.get("metadata");
 			const metadata = JSON.parse(
@@ -117,43 +134,23 @@ export function makeMockCloudflareApi(): MockCloudflareApi {
 				bindings: Array<Record<string, unknown>>;
 				compatibility_date: string;
 				compatibility_flags: string[];
+				tags?: string[];
 			};
 			const scriptPart = form.get("worker.js");
 			const scriptBody =
 				typeof scriptPart === "string"
 					? scriptPart
 					: await (scriptPart as Blob).text();
-			state.uploadedWorkers.push({
+			state.uploadedScripts.push({
+				namespace,
 				scriptName,
 				scriptBody,
 				bindings: metadata.bindings,
 				compatibilityDate: metadata.compatibility_date,
 				compatibilityFlags: metadata.compatibility_flags,
+				...(metadata.tags ? { tags: metadata.tags } : {}),
 			});
 			return envelope(true, null);
-		}
-
-		// Custom domain bind.
-		if (method === "PUT" && url.includes("/workers/domains")) {
-			const body = JSON.parse(init?.body as string) as {
-				hostname: string;
-				service: string;
-				zone_id: string;
-			};
-			const domainId = `dom-${state.boundDomains.length + 1}`;
-			state.boundDomains.push({
-				scriptName: body.service,
-				hostname: body.hostname,
-				zoneId: body.zone_id,
-				domainId,
-			});
-			return envelope(true, {
-				id: domainId,
-				zone_id: body.zone_id,
-				hostname: body.hostname,
-				service: body.service,
-				environment: "production",
-			});
 		}
 
 		return envelope(false, null, [
@@ -195,13 +192,17 @@ export function makeInMemoryStore(): TenantStore & {
 	};
 }
 
-export function makeStubBundle(scriptBody = "/* skribb-cms bundle */"): BundleLoader {
+export function makeStubBundle(
+	scriptBody = "/* skribb-cms bundle */",
+	emdashVersion = "0.14.0",
+): BundleLoader {
 	return {
 		async load() {
 			return {
 				scriptBody,
 				compatibilityDate: "2026-05-01",
 				compatibilityFlags: ["nodejs_compat"],
+				emdashVersion,
 			};
 		},
 	};

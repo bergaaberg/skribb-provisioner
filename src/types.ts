@@ -1,5 +1,10 @@
 /**
  * Public types for `@skribb/provisioner`.
+ *
+ * Targets Workers for Platforms (WfP). The per-tenant deploy unit is a
+ * dispatch namespace script, not a bare Worker — so the state machine
+ * doesn't need a per-tenant custom-domain binding step. Routing is
+ * handled by a single dispatcher Worker (see ../dispatcher/).
  */
 
 export type ProvisioningStep =
@@ -9,13 +14,11 @@ export type ProvisioningStep =
 	| "d1_created"
 	/** R2 bucket created. */
 	| "r2_created"
-	/** Worker script uploaded with bindings. */
-	| "worker_uploaded"
-	/** Custom domain bound to the worker. */
-	| "domain_bound"
+	/** Namespace script uploaded with bindings. */
+	| "script_uploaded"
 	/** EmDash migrations run + initial admin user created. */
 	| "bootstrapped"
-	/** Provisioning complete; tenant is live. */
+	/** Provisioning complete; tenant is live behind the dispatcher. */
 	| "ready"
 	/** Provisioning aborted; manual recovery needed. */
 	| "failed";
@@ -24,8 +27,8 @@ export interface TenantResources {
 	d1Id?: string;
 	d1Name?: string;
 	r2BucketName?: string;
-	workerName?: string;
-	workerDomainId?: string;
+	/** Script name inside the dispatch namespace (e.g. "skribb-cms-alice"). */
+	scriptName?: string;
 }
 
 export interface TenantRecord {
@@ -69,17 +72,22 @@ export interface BundleLoader {
 		scriptBody: string;
 		compatibilityDate: string;
 		compatibilityFlags?: string[];
+		/** EmDash version this bundle ships with — recorded as a tag on the namespace script. */
+		emdashVersion?: string;
 	}>;
 }
 
 /**
- * Bootstraps a freshly-deployed tenant Worker: runs EmDash migrations
- * and creates the initial admin user. Implementation calls the deployed
- * Worker's `/_skribb/provision` endpoint with a one-time provisioning
- * token (also injected as a binding at upload time).
+ * Bootstraps a freshly-deployed tenant: runs EmDash migrations and
+ * creates the initial admin user. Implementation calls into the
+ * deployed Worker's `/_skribb/provision` endpoint with a one-time
+ * provisioning token (also injected as a binding at upload time).
  *
- * Split from the orchestrator so tests can replace it with a no-op. The
- * skribb-cms template owns the `/_skribb/provision` route on its side.
+ * The hostname passed in is the customer-facing host; the dispatcher
+ * Worker routes it to the right namespace member, so the bootstrap
+ * client doesn't need to know about WfP internals.
+ *
+ * Split from the orchestrator so tests can replace it with a no-op.
  */
 export interface BootstrapClient {
 	bootstrap(input: {
@@ -101,18 +109,21 @@ export interface ProvisionInput {
 export interface ProvisionConfig {
 	/** e.g. "cms.skribb.no" — every tenant gets `<handle>.<cmsBaseDomain>`. */
 	cmsBaseDomain: string;
-	/** Cloudflare zone id for `skribb.no`. */
-	zoneId: string;
+	/**
+	 * Dispatch namespace into which we upload tenant scripts. Created
+	 * once at platform bootstrap time, then reused for every tenant.
+	 */
+	dispatchNamespace: string;
 	/** Naming template helpers — keep all naming in one place. */
 	naming?: {
 		d1: (handle: string) => string;
 		r2: (handle: string) => string;
-		worker: (handle: string) => string;
+		script: (handle: string) => string;
 	};
 	/**
-	 * Generates a single-use token embedded in the deployed Worker as a
-	 * binding and used by `BootstrapClient` to authenticate the bootstrap
-	 * call. Default: 32 random bytes hex-encoded.
+	 * Generates a single-use token embedded in the deployed script as a
+	 * binding and used by `BootstrapClient` to authenticate the
+	 * bootstrap call. Default: 32 random bytes hex-encoded.
 	 */
 	mintProvisioningToken?: () => string;
 	/**

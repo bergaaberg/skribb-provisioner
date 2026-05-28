@@ -1,31 +1,33 @@
 /**
- * Tenant provisioning orchestrator.
+ * Tenant provisioning orchestrator — Workers for Platforms shape.
  *
- * Shape: a state machine over a `TenantRecord`. Each transition is one
- * Cloudflare API call followed by `store.put(record)`. If a transition
- * throws, the record stays at the previous step — the next call to
- * `provisionTenant` for the same creator picks up from there.
+ * The state machine is one step shorter than the bare-Workers version:
+ * routing is handled by the operator's dispatcher Worker (see
+ * ../dispatcher/), so there's no per-tenant custom-domain binding to
+ * sequence.
  *
- * Each step body is wrapped in `step(record, target, fn)` which:
- *   - skips if the record is already at `target` or beyond
- *   - runs `fn` to update the record's resources
- *   - advances the step
- *   - persists
+ * State machine:
+ *   reserved → d1_created → r2_created → script_uploaded → bootstrapped → ready
  *
- * The state machine ordering matters: D1 + R2 must exist *before* the
- * Worker upload (their ids/names go into the Worker's bindings); domain
- * binding requires the Worker to exist; bootstrap requires the domain
- * to be live. If a downstream step fails, the upstream resources stay
- * intact — re-running picks them up by id from the persisted record.
+ * Each transition is one Cloudflare API call followed by
+ * `store.put(record)`. If a transition throws, the record stays at
+ * the previous step and is marked `failed` — the next call to
+ * `provisionTenant` for the same creator will throw `failed state`
+ * until recovery is explicit.
+ *
+ * Resource ordering matters: D1 + R2 must exist *before* the namespace
+ * script upload (their ids/names go into the script's bindings). The
+ * bootstrap step requires the script to be live in the namespace; the
+ * dispatcher Worker routes the bootstrap request to the new tenant.
  *
  * What this module does NOT do:
- *   - delete resources on failure. Cleanup is a separate operation
- *     surfaced via the `failed` state; the assumption is that orphaned
- *     resources are cheap (a few cents/month max) and recovery is
- *     manual review-friendly.
- *   - validate the input (handle / email shape). The caller — skribb.no's
- *     onboarding handler — is responsible for that.
- *   - charge / bill / enforce quotas. Separate concern.
+ *   - delete resources on failure (cleanup is a separate operation
+ *     surfaced via the `failed` state)
+ *   - validate input (handle / email shape) — skribb.no's onboarding
+ *     handler is responsible
+ *   - charge / bill / enforce quotas — separate concern
+ *   - create the dispatch namespace itself — that's a one-time
+ *     operator setup, not per-tenant
  */
 
 import type { CloudflareApi } from "./cloudflare-api.js";
@@ -51,23 +53,19 @@ const STEP_ORDER: ProvisioningStep[] = [
 	"reserved",
 	"d1_created",
 	"r2_created",
-	"worker_uploaded",
-	"domain_bound",
+	"script_uploaded",
 	"bootstrapped",
 	"ready",
 ];
 
 function rank(step: ProvisioningStep): number {
-	const i = STEP_ORDER.indexOf(step);
-	// `failed` sorts as -1 so step() never skips on a failed record —
-	// the orchestrator should explicitly recover before continuing.
-	return i;
+	return STEP_ORDER.indexOf(step);
 }
 
 const DEFAULT_NAMING = {
 	d1: (handle: string) => `skribb-cms-${handle}`,
 	r2: (handle: string) => `skribb-cms-media-${handle}`,
-	worker: (handle: string) => `skribb-cms-${handle}`,
+	script: (handle: string) => `skribb-cms-${handle}`,
 };
 
 function defaultMintToken(): string {
@@ -123,7 +121,6 @@ export async function provisionTenant(
 		config.mintProvisioningToken ?? defaultMintToken
 	)();
 
-	// Helper: run a transition only if we're behind the target step.
 	const step = async (
 		target: ProvisioningStep,
 		fn: (current: TenantRecord) => Promise<Partial<TenantResources>>,
@@ -160,18 +157,23 @@ export async function provisionTenant(
 		return { r2BucketName: bucket.name };
 	});
 
-	await step("worker_uploaded", async (cur) => {
+	await step("script_uploaded", async (cur) => {
 		if (!cur.resources.d1Id || !cur.resources.r2BucketName) {
 			throw new Error(
-				"worker_uploaded: missing prerequisite resources (d1 or r2)",
+				"script_uploaded: missing prerequisite resources (d1 or r2)",
 			);
 		}
 		const bundleData = await deps.bundle.load();
-		await deps.cf.uploadWorker({
-			scriptName: naming.worker(input.handle),
+		const scriptName = naming.script(input.handle);
+		await deps.cf.uploadNamespaceScript({
+			namespace: config.dispatchNamespace,
+			scriptName,
 			scriptBody: bundleData.scriptBody,
 			compatibilityDate: bundleData.compatibilityDate,
 			compatibilityFlags: bundleData.compatibilityFlags,
+			tags: bundleData.emdashVersion
+				? [`emdash-version:${bundleData.emdashVersion}`]
+				: undefined,
 			bindings: [
 				{ type: "d1", name: "DB", id: cur.resources.d1Id },
 				{
@@ -192,19 +194,7 @@ export async function provisionTenant(
 				},
 			],
 		});
-		return { workerName: naming.worker(input.handle) };
-	});
-
-	await step("domain_bound", async (cur) => {
-		if (!cur.resources.workerName) {
-			throw new Error("domain_bound: missing worker");
-		}
-		const domain = await deps.cf.bindWorkerCustomDomain({
-			scriptName: cur.resources.workerName,
-			hostname,
-			zoneId: config.zoneId,
-		});
-		return { workerDomainId: domain.id };
+		return { scriptName };
 	});
 
 	await step("bootstrapped", async () => {

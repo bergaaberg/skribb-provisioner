@@ -1,0 +1,25 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "skribb-dispatcher",
+	"main": "./src/worker.ts",
+	"compatibility_date": "2026-05-01",
+	"compatibility_flags": ["nodejs_compat"],
+
+	// One wildcard route owns every tenant subdomain. Routes are
+	// longest-match, so a future per-tenant override could land more
+	// specific routes if needed.
+	"routes": [
+		{ "pattern": "*.cms.skribb.no/*", "zone_name": "skribb.no" }
+	],
+
+	// The dispatch namespace into which the provisioner uploads each
+	// tenant's user Worker.
+	"dispatch_namespaces": [
+		{ "binding": "DISPATCH_NAMESPACE", "namespace": "skribb-tenants" }
+	],
+
+	"vars": {
+		"CMS_BASE_DOMAIN": "cms.skribb.no",
+		"SCRIPT_PREFIX": "skribb-cms-"
+	}
+}

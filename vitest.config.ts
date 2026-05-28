@@ -2,7 +2,8 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
 	test: {
-		include: ["tests/**/*.test.ts"],
+		// Library tests at tests/**, dispatcher tests at dispatcher/tests/**.
+		include: ["tests/**/*.test.ts", "dispatcher/tests/**/*.test.ts"],
 		environment: "node",
 	},
 });

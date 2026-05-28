@@ -3,11 +3,11 @@ export {
 	CloudflareApiError,
 	type CloudflareApiOptions,
 	type D1Database,
+	type DispatchNamespace,
 	type Fetcher,
+	type NamespaceScriptUploadInput,
 	type R2Bucket,
 	type WorkerBinding,
-	type WorkerDomain,
-	type WorkerUploadInput,
 } from "./cloudflare-api.js";
 
 export { provisionTenant, type ProvisionDeps } from "./provision.js";

@@ -1,37 +1,64 @@
 # @skribb/provisioner
 
-Per-creator EmDash provisioning for skribb.
+Per-creator EmDash provisioning for skribb, targeting **Workers for Platforms**.
 
 Companion to [bergaaberg/skribb-cms#1](https://github.com/bergaaberg/skribb-cms/issues/1)
-(the Option C spike). This package explores **Option B** — one fresh
-EmDash Worker per creator, fully automated.
+(the Option C spike). This package is the Option B path — one fresh
+EmDash deployment per creator, fully automated, behind a single
+dispatcher Worker.
 
-> Status: orchestration PoC. The state machine + Cloudflare API client
-> + tests are real and shippable. Wiring into skribb.no's onboarding
-> flow, the deployed-bundle pipeline, and the bootstrap endpoint on
-> the skribb-cms template are still to do.
+> Status: orchestration + dispatcher PoC. The state machine + Cloudflare
+> API client + dispatcher Worker + tests are real and shippable. Wiring
+> into skribb.no's onboarding flow, the deployed-bundle pipeline, and
+> the bootstrap endpoint on the skribb-cms template are still to do.
 
-## What this is
+## Architecture
 
-A small TypeScript library that takes a creator handle + email and:
+```
+                       *.cms.skribb.no/*
+                              │
+                              ▼
+                  ┌───────────────────────┐
+                  │  skribb-dispatcher    │  (this repo, dispatcher/)
+                  │  • parses Host header │
+                  │  • DISPATCH_NAMESPACE │
+                  │    .get(name).fetch() │
+                  └───────────┬───────────┘
+                              │
+       ┌──────────────────────┼──────────────────────┐
+       ▼                      ▼                      ▼
+  skribb-cms-alice      skribb-cms-bob         skribb-cms-...
+   (D1 + R2 + bundle)    (D1 + R2 + bundle)    (D1 + R2 + bundle)
+                                                each provisioned by
+                                                @skribb/provisioner
+```
 
-1. Creates a per-tenant D1 database via the Cloudflare API.
-2. Creates a per-tenant R2 bucket.
-3. Uploads a Worker bundle (the skribb-cms template) with bindings
-   for that creator's D1 + R2.
-4. Binds `<handle>.cms.skribb.no` to the new Worker.
-5. Calls the new Worker's bootstrap endpoint to run EmDash migrations
-   and create the initial admin user.
+**Components:**
 
-The state machine persists after every step, so a crash mid-provision
-can resume from the last completed step rather than restart.
+- **`@skribb/provisioner`** (this package) — TypeScript library used
+  by skribb.no's onboarding handler. Creates D1, R2, and uploads the
+  tenant's user Worker into the dispatch namespace.
+- **`dispatcher/`** — a small Worker the platform operator deploys
+  once. Owns the wildcard route, parses the Host header, forwards
+  every request to the right namespace member.
+- **Per-tenant Workers** — each creator's EmDash instance, deployed
+  inside the dispatch namespace.
 
-## Why a separate package
+## Why Workers for Platforms
 
-skribb.no (the platform) will import this from its onboarding handler,
-but the package itself doesn't depend on any framework. Library-shaped
-keeps it portable, testable in plain Node, and reusable if we ever run
-provisioning from a CLI / background queue rather than HTTP.
+- **No script-count cap on the per-tenant unit.** Workers Paid has a
+  hard 500/account limit; WfP lifts it (1000 included + overage). The
+  $20/mo platform fee is cheap insurance against a forced
+  mid-pilot rearchitecture.
+- **Native fleet management.** Tags on namespace scripts let us later
+  filter "all tenants on EmDash 0.14" for batch redeploys.
+- **Native isolation.** Cloudflare-enforced separation between
+  tenants; no shared isolate, no cache-pollution class of bug.
+- **Bundled headroom.** WfP includes 2× requests + 2× CPU vs Workers
+  Paid for the same overage rate. Break-even with WP usage past ~10M
+  requests/mo or ~30M CPU-ms/mo across all tenants combined.
+
+See the rationale in [bergaaberg/skribb#1](https://github.com/bergaaberg/skribb/issues/1) thread.
 
 ## Public surface
 
@@ -53,7 +80,7 @@ const result = await provisionTenant(
   { creatorId, handle, email },
   {
     cmsBaseDomain: "cms.skribb.no",
-    zoneId: env.CLOUDFLARE_ZONE_ID,
+    dispatchNamespace: "skribb-tenants",
   },
 );
 ```
@@ -61,30 +88,38 @@ const result = await provisionTenant(
 Returns a `TenantRecord` whose `step` field will be either `"ready"`
 (success) or `"failed"` (caller catches the error and surfaces it).
 
+State machine: `reserved → d1_created → r2_created → script_uploaded → bootstrapped → ready`.
+
+Each transition is one Cloudflare API call followed by a
+`store.put()`. A crash mid-provision leaves the record at the last
+completed step; re-running picks up from there. A `failed` record
+won't auto-retry — recovery is an explicit operation.
+
 ## What's NOT in scope here
 
 - **The skribb-cms bundle pipeline.** Production needs CI to build the
   Astro+EmDash artifact and stash it somewhere this provisioner can
   fetch from (`BundleLoader` impl). The PoC uses a stub.
-- **The bootstrap endpoint on skribb-cms.** The deployed Worker needs
-  to expose `/_skribb/provision` (POST, auth via the `PROVISIONING_TOKEN`
-  secret binding) that runs EmDash migrations and creates the initial
-  admin. Contract is named in `BootstrapClient`; implementation lives
-  on the skribb-cms side.
+- **The bootstrap endpoint on skribb-cms.** The deployed tenant
+  Worker needs to expose `/_skribb/provision` (POST, auth via the
+  `PROVISIONING_TOKEN` secret binding) that runs EmDash migrations
+  and creates the initial admin user. Contract named in
+  `BootstrapClient`; implementation lives on the skribb-cms side.
+- **The dispatch namespace itself.** One-time platform setup, not
+  per-tenant. `CloudflareApi.createDispatchNamespace()` is exposed
+  for bootstrap scripts but the orchestrator assumes the namespace
+  already exists.
 - **The control-plane UI.** Listing tenants, retrying failures,
-  un-provisioning. These are skribb.no admin tooling, not part of this
-  library.
-- **Cost-of-ownership concerns.** Deploy fanout on EmDash version
-  bumps, tenant quota enforcement, billing. Out of scope.
+  un-provisioning. skribb.no admin tooling, not this library.
+- **Bump fanout.** When EmDash bumps, you redeploy N tenants. Same CF
+  client, similar state-machine shape, separate function — out of
+  scope here.
 
 ## Wiring sketch — skribb.no `/api/onboarding`
 
 ```ts
 // apps/web/src/app/api/onboarding/route.ts (sketch)
-import {
-  CloudflareApi,
-  provisionTenant,
-} from "@skribb/provisioner";
+import { CloudflareApi, provisionTenant } from "@skribb/provisioner";
 import { kyselyTenantStore, bundleFromR2, httpsBootstrap } from "./adapters";
 
 export async function POST(req: Request) {
@@ -96,7 +131,7 @@ export async function POST(req: Request) {
     .values({ id: creatorId, handle, email, cms_status: "provisioning" })
     .execute();
 
-  // 2. Provision the EmDash instance
+  // 2. Provision the EmDash instance behind the dispatcher
   try {
     const tenant = await provisionTenant(
       {
@@ -109,7 +144,7 @@ export async function POST(req: Request) {
         bootstrap: httpsBootstrap(),
       },
       { creatorId, handle, email },
-      { cmsBaseDomain: "cms.skribb.no", zoneId: env.CF_ZONE_ID },
+      { cmsBaseDomain: "cms.skribb.no", dispatchNamespace: "skribb-tenants" },
     );
     await env.DB.updateTable("writers")
       .set({ cms_status: "ready", cms_url: `https://${tenant.hostname}` })
@@ -117,9 +152,8 @@ export async function POST(req: Request) {
       .execute();
     return Response.redirect(`https://${tenant.hostname}/_skribb/sso?...`);
   } catch (err) {
-    // Tenant record is in the "failed" state in our table — surface to
-    // admin tooling for manual recovery. Don't auto-retry; the
-    // orchestrator refuses to touch a failed record.
+    // Tenant record is in the "failed" state — surface to admin
+    // tooling. Don't auto-retry; the orchestrator refuses.
     return new Response("Provisioning failed; we've been alerted.", {
       status: 500,
     });
@@ -130,36 +164,41 @@ export async function POST(req: Request) {
 ## Test coverage
 
 ```sh
-pnpm test         # 17 tests:
-                  #   cloudflare-api.test.ts (7) — HTTP envelope, auth, error mapping
-                  #   provision.test.ts     (10) — orchestration:
-                  #                                · happy path (3)
+pnpm test         # 29 tests across three suites:
+                  #   cloudflare-api.test.ts (9)  — HTTP envelope, auth, WfP endpoints
+                  #   provision.test.ts      (11) — orchestration:
+                  #                                · happy path (5)
                   #                                · idempotent resume (2)
-                  #                                · failure handling (5)
+                  #                                · failure handling (4)
+                  #   dispatcher/host-resolver (9) — host → script name parsing
 pnpm typecheck    # tsc --noEmit
 ```
 
-The provision tests exercise the state machine against an in-memory
-CF API mock that captures every request — assertions cover both
-control flow (D1 before Worker before domain) and effects (right
-bindings, right names, right token).
+The provision tests run against an in-memory CF API mock that captures
+every request — assertions cover both control flow (D1 before R2
+before script upload before bootstrap) and effects (right namespace,
+right bindings, right tags, right token).
+
+The dispatcher tests are pure: they cover the host-parsing logic in
+isolation. The runtime dispatch call (`env.DISPATCH_NAMESPACE.get(...).fetch(...)`)
+isn't mocked — that surface is small enough to verify in staging
+rather than ceremonially-tested.
 
 ## Open design questions
 
-- **Where does the bundle live?** Two candidates: build artifact in R2
-  (fast, simple, requires CI to push); npm registry tarball (mature
+- **Where does the bundle live?** Two candidates: build artifact in
+  R2 (fast, simple, requires CI to push); npm registry tarball (mature
   versioning, slower to fetch). Probably R2 keyed by EmDash version.
-- **R2 bucket per tenant vs shared bucket with prefix?** Per-bucket is
-  the consistent answer given D1 is per-tenant — but if R2's bucket
-  limit becomes a concern at scale, the shared-bucket-with-prefix
-  pattern from the Option C spike is portable here.
+- **R2 bucket per tenant vs shared bucket with prefix?** Currently
+  per-bucket (matches the D1-per-tenant model). If R2 bucket counts
+  become a concern at scale, the prefix-based pattern from the Option
+  C spike is portable here.
 - **How does the creator's first session start?** After
   `provisionTenant` returns, the response is a redirect to the new
   EmDash instance. That redirect needs to carry a signed token the
   EmDash side trusts (separate from `PROVISIONING_TOKEN` which is
   one-shot). Likely: skribb.no signs a short-lived JWT; the deployed
   Worker has skribb.no's public key as a binding and validates.
-- **What happens at EmDash bump time?** Cross-cutting concern, not a
-  provisioner question per se. Likely: a separate `bumpTenant(creatorId)`
-  function that re-uploads the Worker bundle and re-runs migrations.
-  Same Cloudflare client, similar state-machine shape.
+- **EmDash version-bump fanout.** Cross-cutting; separate
+  `bumpTenant(creatorId)` function alongside this one. Likely
+  filter-by-tag → re-upload bundle → re-run migrations.

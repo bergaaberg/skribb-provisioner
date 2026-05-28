@@ -1,25 +1,27 @@
 /**
- * Minimal Cloudflare REST API client — only the endpoints provisioning needs.
+ * Minimal Cloudflare REST API client — Workers for Platforms shape.
  *
- * Each method is a thin wrapper around one HTTP call. Response unwrapping
- * (`{ success, errors, result }` → throw on failure, return `result`) lives
- * in `request()`. Idempotency, retry, and orchestration belong to the
- * caller (`provision.ts`), not here.
+ * Targets the WfP deployment model: a single dispatch namespace owns
+ * every tenant's user Worker; a separate dispatcher Worker (deployed
+ * by the operator, see ../dispatcher/) routes requests to namespace
+ * members by host header.
  *
  * Constructor takes an optional `fetch` impl so tests can pass an
  * in-memory mock without monkey-patching globals.
  *
  * Coverage scope:
- *   - D1: create
- *   - R2: create bucket
- *   - Workers: upload script (single-module), bind custom domain
- *   - Generic: HTTP DELETE (used by `cleanup()` paths in the orchestrator)
+ *   - D1: create, delete
+ *   - R2: create bucket, delete bucket
+ *   - Workers for Platforms:
+ *       - dispatch namespace: create (one-time, operator setup)
+ *       - namespace script: upload (per-tenant), delete
  *
- * Out of scope (deliberately): D1 query (we use a deployed Worker for that),
- * KV/Queue/DO provisioning (not needed for the EmDash template), zone DNS
- * record creation (custom domain binding via Workers handles DNS itself).
+ * Out of scope (deliberately):
+ *   - Bare Workers script upload — WfP uses namespace scripts instead.
+ *   - Per-tenant custom domain binding — WfP routes via the dispatcher.
+ *   - D1 query (use a deployed Worker), KV / Queue / DO provisioning.
  *
- * Cloudflare API ref:
+ * Cloudflare API reference:
  *   https://developers.cloudflare.com/api/
  */
 
@@ -48,19 +50,17 @@ export interface R2Bucket {
 	creation_date?: string;
 }
 
-export interface WorkerDomain {
-	id: string;
-	zone_id: string;
-	hostname: string;
-	service: string;
-	environment: string;
+export interface DispatchNamespace {
+	namespace_id: string;
+	namespace_name: string;
+	created_on?: string;
 }
 
 /**
- * Worker script upload binding metadata. The Workers REST API accepts a
- * superset of these; we only use the kinds the EmDash template needs.
+ * Worker script upload binding metadata.
  *
- * Names mirror wrangler.jsonc / workers script-metadata for predictability.
+ * For namespace scripts the binding kinds are the same as bare scripts —
+ * the deployment surface differs but the runtime shape doesn't.
  */
 export type WorkerBinding =
 	| { type: "d1"; name: string; id: string }
@@ -68,8 +68,10 @@ export type WorkerBinding =
 	| { type: "plain_text"; name: string; text: string }
 	| { type: "secret_text"; name: string; text: string };
 
-export interface WorkerUploadInput {
-	/** Worker script name (URL-safe). */
+export interface NamespaceScriptUploadInput {
+	/** Dispatch namespace name (e.g. "skribb-tenants"). */
+	namespace: string;
+	/** Per-tenant script name (e.g. "skribb-cms-alice"). */
 	scriptName: string;
 	/** The compiled bundle. */
 	scriptBody: string;
@@ -79,6 +81,12 @@ export interface WorkerUploadInput {
 	compatibilityDate: string;
 	/** Compatibility flags (e.g. ["nodejs_compat"]). */
 	compatibilityFlags?: string[];
+	/**
+	 * Optional tags — WfP uses these for fleet-wide management
+	 * (filtering, bulk operations). Useful later for things like
+	 * "find all tenants pinned to EmDash 0.14".
+	 */
+	tags?: string[];
 }
 
 interface CfEnvelope<T> {
@@ -127,10 +135,6 @@ export class CloudflareApi {
 			headers,
 			...(init?.body !== undefined ? { body: init.body } : {}),
 		});
-		// Cloudflare always wraps JSON responses in the envelope, but some
-		// endpoints (Workers script upload on success) return 200 with an
-		// envelope that has `result: null` plus a meta object. Treat
-		// `success: true` as canonical regardless of `result`.
 		let envelope: CfEnvelope<T>;
 		try {
 			envelope = (await res.json()) as CfEnvelope<T>;
@@ -186,25 +190,40 @@ export class CloudflareApi {
 		);
 	}
 
-	// ── Workers ──────────────────────────────────────────────────────────
+	// ── Workers for Platforms ────────────────────────────────────────────
 
 	/**
-	 * Upload a Worker script. Single-module ES Modules format
-	 * (multipart, with the metadata part declaring the main module). The
-	 * caller supplies the already-bundled script body as a string.
-	 *
-	 * The CF API supports multi-module deploys (each module a separate
-	 * form part) — we don't need that here because the EmDash + skribb-cms
-	 * template ships as a single bundled script via the Astro Cloudflare
-	 * adapter.
+	 * Create a dispatch namespace. One-time operator setup, not a
+	 * per-tenant call. Exposed here so the platform's bootstrapping
+	 * script (or onboarding admin tooling) can ensure idempotency
+	 * without going through wrangler.
 	 */
-	async uploadWorker(input: WorkerUploadInput): Promise<null> {
+	createDispatchNamespace(name: string): Promise<DispatchNamespace> {
+		return this.request<DispatchNamespace>(
+			"POST",
+			`/accounts/${this.accountId}/workers/dispatch/namespaces`,
+			{
+				body: JSON.stringify({ name }),
+				headers: { "content-type": "application/json" },
+			},
+		);
+	}
+
+	/**
+	 * Upload a user Worker into a dispatch namespace. Single-module
+	 * ES Modules format (multipart, metadata declares the main module).
+	 *
+	 * This is the per-tenant call: each creator gets one namespace
+	 * script with their own D1 + R2 bindings.
+	 */
+	async uploadNamespaceScript(input: NamespaceScriptUploadInput): Promise<null> {
 		const form = new FormData();
 		const metadata = {
 			main_module: "worker.js",
 			compatibility_date: input.compatibilityDate,
 			compatibility_flags: input.compatibilityFlags ?? [],
 			bindings: input.bindings,
+			...(input.tags ? { tags: input.tags } : {}),
 		};
 		form.append(
 			"metadata",
@@ -217,48 +236,15 @@ export class CloudflareApi {
 		);
 		return this.request<null>(
 			"PUT",
-			`/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(input.scriptName)}`,
+			`/accounts/${this.accountId}/workers/dispatch/namespaces/${encodeURIComponent(input.namespace)}/scripts/${encodeURIComponent(input.scriptName)}`,
 			{ body: form },
 		);
 	}
 
-	deleteWorker(scriptName: string): Promise<null> {
+	deleteNamespaceScript(input: { namespace: string; scriptName: string }): Promise<null> {
 		return this.request<null>(
 			"DELETE",
-			`/accounts/${this.accountId}/workers/scripts/${encodeURIComponent(scriptName)}`,
-		);
-	}
-
-	/**
-	 * Bind a custom domain (e.g. `<creator>.cms.skribb.no`) to a deployed
-	 * Worker. Cloudflare provisions DNS and TLS automatically; the API
-	 * returns a domain id we can use to detach later.
-	 */
-	bindWorkerCustomDomain(input: {
-		scriptName: string;
-		hostname: string;
-		zoneId: string;
-		environment?: string;
-	}): Promise<WorkerDomain> {
-		return this.request<WorkerDomain>(
-			"PUT",
-			`/accounts/${this.accountId}/workers/domains`,
-			{
-				body: JSON.stringify({
-					environment: input.environment ?? "production",
-					hostname: input.hostname,
-					service: input.scriptName,
-					zone_id: input.zoneId,
-				}),
-				headers: { "content-type": "application/json" },
-			},
-		);
-	}
-
-	deleteWorkerDomain(domainId: string): Promise<null> {
-		return this.request<null>(
-			"DELETE",
-			`/accounts/${this.accountId}/workers/domains/${encodeURIComponent(domainId)}`,
+			`/accounts/${this.accountId}/workers/dispatch/namespaces/${encodeURIComponent(input.namespace)}/scripts/${encodeURIComponent(input.scriptName)}`,
 		);
 	}
 }
