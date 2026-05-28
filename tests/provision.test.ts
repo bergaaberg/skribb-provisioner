@@ -42,6 +42,10 @@ describe("provisionTenant — happy path", () => {
 			d1Name: "skribb-cms-alice",
 			r2BucketName: "skribb-cms-media-alice",
 			scriptName: "skribb-cms-alice",
+			currentEmdashVersion: "0.14.0",
+			// `currentBundleSha` is undefined here because the default
+			// stub bundle doesn't set `gitShortSha` (the third arg).
+			// The dedicated tag test below covers the SHA branch.
 		});
 
 		expect(cf.state.createdDatabases).toEqual([
@@ -89,12 +93,13 @@ describe("provisionTenant — happy path", () => {
 		});
 	});
 
-	it("tags the namespace script with the EmDash version", async () => {
-		// Tags let us later filter/find "all tenants on EmDash 0.14" for
-		// batch redeploys. WfP supports this natively.
+	it("tags the namespace script with the EmDash version + bundle SHA", async () => {
+		// Tags let us later filter/find "all tenants on EmDash 0.14 with
+		// bundle sha abc1234" for targeted batch redeploys. WfP supports
+		// this natively.
 		const cf = makeMockCloudflareApi();
 		const store = makeInMemoryStore();
-		const bundle = makeStubBundle("/* body */", "0.14.0");
+		const bundle = makeStubBundle("/* body */", "0.14.0", "abc1234567");
 		const bootstrap = makeMockBootstrap();
 
 		await provisionTenant(
@@ -105,7 +110,36 @@ describe("provisionTenant — happy path", () => {
 
 		expect(cf.state.uploadedScripts[0]!.tags).toEqual([
 			"emdash-version:0.14.0",
+			"bundle-sha:abc1234567",
 		]);
+	});
+
+	it("uploads every module from the bundle (not just the main one)", async () => {
+		// Sanity: a single-module bundle would silently still work; a
+		// multi-module bundle was the actual reason for the v2 upload
+		// interface. Stub returns 2 modules — both must reach the wire.
+		const cf = makeMockCloudflareApi();
+		const store = makeInMemoryStore();
+		const bundle = makeStubBundle();
+		const bootstrap = makeMockBootstrap();
+
+		await provisionTenant(
+			{ cf: cf.api, store, bundle, bootstrap },
+			input,
+			config,
+		);
+
+		const uploaded = cf.state.uploadedScripts[0]!;
+		expect(uploaded.modules).toHaveLength(2);
+		expect(uploaded.modules.map((m) => m.name).sort()).toEqual([
+			"chunks/stub.mjs",
+			"entry.mjs",
+		]);
+		expect(uploaded.mainModule).toBe("entry.mjs");
+		// Every uploaded module should carry the ESM content type.
+		for (const m of uploaded.modules) {
+			expect(m.contentType).toBe("application/javascript+module");
+		}
 	});
 
 	it("calls bootstrap with the same token that's embedded in the script", async () => {

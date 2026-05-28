@@ -7,10 +7,18 @@ export {
 	type Fetcher,
 	type NamespaceScriptUploadInput,
 	type R2Bucket,
+	type ScriptModule,
 	type WorkerBinding,
 } from "./cloudflare-api.js";
 
 export { provisionTenant, type ProvisionDeps } from "./provision.js";
+
+export {
+	bumpTenant,
+	type BumpDeps,
+	type BumpInput,
+	type BumpResult,
+} from "./bump.js";
 
 export type {
 	BootstrapClient,

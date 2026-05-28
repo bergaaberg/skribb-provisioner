@@ -22,7 +22,8 @@ import type {
 interface CapturedScript {
 	namespace: string;
 	scriptName: string;
-	scriptBody: string;
+	modules: Array<{ name: string; body: string; contentType: string }>;
+	mainModule: string;
 	bindings: Array<Record<string, unknown>>;
 	compatibilityDate: string;
 	compatibilityFlags: string[];
@@ -112,13 +113,13 @@ export function makeMockCloudflareApi(): MockCloudflareApi {
 			});
 		}
 
-		// Namespace script upload (PUT with multipart body).
+		// Namespace script upload (PUT with multipart body). The form
+		// has a `metadata` part plus one part per script module.
 		if (
 			method === "PUT" &&
 			url.includes("/workers/dispatch/namespaces/") &&
 			url.includes("/scripts/")
 		) {
-			// Path: .../namespaces/{ns}/scripts/{script}
 			const segments = url.split("/");
 			const nsIdx = segments.indexOf("namespaces");
 			const namespace = decodeURIComponent(segments[nsIdx + 1] ?? "");
@@ -134,17 +135,30 @@ export function makeMockCloudflareApi(): MockCloudflareApi {
 				bindings: Array<Record<string, unknown>>;
 				compatibility_date: string;
 				compatibility_flags: string[];
+				main_module: string;
 				tags?: string[];
 			};
-			const scriptPart = form.get("worker.js");
-			const scriptBody =
-				typeof scriptPart === "string"
-					? scriptPart
-					: await (scriptPart as Blob).text();
+			// Collect every form part that isn't `metadata` — those are
+			// the modules. Use forEach (typed on FormData; `entries`
+			// isn't in lib.dom). Resolve Blobs after the sync pass.
+			const collected: Array<[string, FormDataEntryValue]> = [];
+			form.forEach((value, partName) => {
+				if (partName !== "metadata") collected.push([partName, value]);
+			});
+			const modules: Array<{ name: string; body: string; contentType: string }> = [];
+			for (const [partName, value] of collected) {
+				const blob = value as Blob;
+				modules.push({
+					name: partName,
+					body: typeof value === "string" ? value : await blob.text(),
+					contentType: typeof value === "string" ? "text/plain" : blob.type,
+				});
+			}
 			state.uploadedScripts.push({
 				namespace,
 				scriptName,
-				scriptBody,
+				modules,
+				mainModule: metadata.main_module,
 				bindings: metadata.bindings,
 				compatibilityDate: metadata.compatibility_date,
 				compatibilityFlags: metadata.compatibility_flags,
@@ -193,16 +207,23 @@ export function makeInMemoryStore(): TenantStore & {
 }
 
 export function makeStubBundle(
-	scriptBody = "/* skribb-cms bundle */",
+	mainBody = "/* skribb-cms bundle */",
 	emdashVersion = "0.14.0",
+	gitShortSha?: string,
 ): BundleLoader {
 	return {
 		async load() {
 			return {
-				scriptBody,
+				modules: [
+					{ name: "entry.mjs", body: mainBody },
+					// One additional chunk so the multi-module path is exercised.
+					{ name: "chunks/stub.mjs", body: "export const x = 1;" },
+				],
+				mainModule: "entry.mjs",
 				compatibilityDate: "2026-05-01",
 				compatibilityFlags: ["nodejs_compat"],
 				emdashVersion,
+				...(gitShortSha ? { gitShortSha } : {}),
 			};
 		},
 	};

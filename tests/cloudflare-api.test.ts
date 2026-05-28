@@ -135,21 +135,39 @@ describe("CloudflareApi — Workers for Platforms", () => {
 	});
 
 	it("uploadNamespaceScript targets the right endpoint and sends multipart", async () => {
-		const captured: { metadata?: string; scriptBody?: string; url?: string } = {};
+		const captured: {
+			url?: string;
+			metadata?: string;
+			modules: Array<{ name: string; body: string }>;
+		} = { modules: [] };
 		const { fetch } = makeFakeFetch(async (url, init) => {
 			captured.url = url;
 			const form = init.body as FormData;
-			const metaPart = form.get("metadata") as Blob;
-			captured.metadata = await metaPart.text();
-			const scriptPart = form.get("worker.js") as Blob;
-			captured.scriptBody = await scriptPart.text();
+			// Collect via forEach (typed on FormData; `entries` isn't in
+			// lib.dom). Then resolve Blobs separately because forEach is
+			// synchronous.
+			const collected: Array<[string, Blob]> = [];
+			form.forEach((value, partName) => {
+				collected.push([partName, value as Blob]);
+			});
+			for (const [partName, blob] of collected) {
+				if (partName === "metadata") {
+					captured.metadata = await blob.text();
+				} else {
+					captured.modules.push({ name: partName, body: await blob.text() });
+				}
+			}
 			return envelope({ success: true, result: null, errors: [], messages: [] });
 		});
 		const api = new CloudflareApi({ apiToken: "t", accountId: "a", fetch });
 		await api.uploadNamespaceScript({
 			namespace: "skribb-tenants",
 			scriptName: "skribb-cms-alice",
-			scriptBody: "export default {}",
+			modules: [
+				{ name: "entry.mjs", body: "export default {}" },
+				{ name: "chunks/x.mjs", body: "export const x = 1;" },
+			],
+			mainModule: "entry.mjs",
 			compatibilityDate: "2026-05-01",
 			compatibilityFlags: ["nodejs_compat"],
 			bindings: [{ type: "d1", name: "DB", id: "d1-x" }],
@@ -159,12 +177,54 @@ describe("CloudflareApi — Workers for Platforms", () => {
 			"https://api.cloudflare.com/client/v4/accounts/a/workers/dispatch/namespaces/skribb-tenants/scripts/skribb-cms-alice",
 		);
 		const meta = JSON.parse(captured.metadata!) as Record<string, unknown>;
-		expect(meta.main_module).toBe("worker.js");
+		expect(meta.main_module).toBe("entry.mjs");
 		expect(meta.compatibility_date).toBe("2026-05-01");
 		expect(meta.compatibility_flags).toEqual(["nodejs_compat"]);
 		expect(meta.tags).toEqual(["emdash-version:0.14.0"]);
 		expect(meta.bindings).toEqual([{ type: "d1", name: "DB", id: "d1-x" }]);
-		expect(captured.scriptBody).toBe("export default {}");
+		// Two modules sent, with their names as the form-part names.
+		expect(captured.modules).toHaveLength(2);
+		expect(captured.modules.map((m) => m.name).sort()).toEqual([
+			"chunks/x.mjs",
+			"entry.mjs",
+		]);
+		expect(
+			captured.modules.find((m) => m.name === "entry.mjs")?.body,
+		).toBe("export default {}");
+	});
+
+	it("rejects an upload with no modules", async () => {
+		const { fetch } = makeFakeFetch(() =>
+			envelope({ success: true, result: null, errors: [], messages: [] }),
+		);
+		const api = new CloudflareApi({ apiToken: "t", accountId: "a", fetch });
+		await expect(
+			api.uploadNamespaceScript({
+				namespace: "ns",
+				scriptName: "s",
+				modules: [],
+				mainModule: "x.mjs",
+				compatibilityDate: "2026-01-01",
+				bindings: [],
+			}),
+		).rejects.toThrow(/cannot be empty/i);
+	});
+
+	it("rejects when mainModule is not in the modules list", async () => {
+		const { fetch } = makeFakeFetch(() =>
+			envelope({ success: true, result: null, errors: [], messages: [] }),
+		);
+		const api = new CloudflareApi({ apiToken: "t", accountId: "a", fetch });
+		await expect(
+			api.uploadNamespaceScript({
+				namespace: "ns",
+				scriptName: "s",
+				modules: [{ name: "a.mjs", body: "" }],
+				mainModule: "not-in-list.mjs",
+				compatibilityDate: "2026-01-01",
+				bindings: [],
+			}),
+		).rejects.toThrow(/not in the modules list/i);
 	});
 
 	it("URL-encodes special characters in namespace + script names", async () => {
@@ -175,7 +235,8 @@ describe("CloudflareApi — Workers for Platforms", () => {
 		await api.uploadNamespaceScript({
 			namespace: "a/b",
 			scriptName: "x y",
-			scriptBody: "",
+			modules: [{ name: "entry.mjs", body: "" }],
+			mainModule: "entry.mjs",
 			compatibilityDate: "2026-01-01",
 			bindings: [],
 		});

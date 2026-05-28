@@ -165,15 +165,21 @@ export async function provisionTenant(
 		}
 		const bundleData = await deps.bundle.load();
 		const scriptName = naming.script(input.handle);
+		const tags: string[] = [];
+		if (bundleData.emdashVersion) {
+			tags.push(`emdash-version:${bundleData.emdashVersion}`);
+		}
+		if (bundleData.gitShortSha) {
+			tags.push(`bundle-sha:${bundleData.gitShortSha}`);
+		}
 		await deps.cf.uploadNamespaceScript({
 			namespace: config.dispatchNamespace,
 			scriptName,
-			scriptBody: bundleData.scriptBody,
+			modules: bundleData.modules,
+			mainModule: bundleData.mainModule,
 			compatibilityDate: bundleData.compatibilityDate,
 			compatibilityFlags: bundleData.compatibilityFlags,
-			tags: bundleData.emdashVersion
-				? [`emdash-version:${bundleData.emdashVersion}`]
-				: undefined,
+			tags: tags.length > 0 ? tags : undefined,
 			bindings: [
 				{ type: "d1", name: "DB", id: cur.resources.d1Id },
 				{
@@ -194,7 +200,11 @@ export async function provisionTenant(
 				},
 			],
 		});
-		return { scriptName };
+		return {
+			scriptName,
+			currentEmdashVersion: bundleData.emdashVersion,
+			currentBundleSha: bundleData.gitShortSha,
+		};
 	});
 
 	await step("bootstrapped", async () => {

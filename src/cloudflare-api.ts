@@ -68,13 +68,44 @@ export type WorkerBinding =
 	| { type: "plain_text"; name: string; text: string }
 	| { type: "secret_text"; name: string; text: string };
 
+/**
+ * One module file within a Worker bundle. Multi-module uploads send
+ * each module as its own multipart form part — `name` becomes the
+ * part name and `body` becomes the file content.
+ *
+ * `name` must be the module's filename relative to the bundle root
+ * (e.g. `"entry.mjs"`, `"chunks/foo.mjs"`). Imports inside the
+ * modules reference each other by these same names.
+ */
+export interface ScriptModule {
+	name: string;
+	body: string | Uint8Array;
+	/**
+	 * MIME type for the upload. Defaults to
+	 * `"application/javascript+module"` (ESM). Use
+	 * `"application/wasm"` for `.wasm` modules, `"text/javascript"` for
+	 * service-worker-format scripts.
+	 */
+	contentType?: string;
+}
+
 export interface NamespaceScriptUploadInput {
 	/** Dispatch namespace name (e.g. "skribb-tenants"). */
 	namespace: string;
 	/** Per-tenant script name (e.g. "skribb-cms-alice"). */
 	scriptName: string;
-	/** The compiled bundle. */
-	scriptBody: string;
+	/**
+	 * The compiled bundle as one or more modules. For Astro+Cloudflare
+	 * builds processed through `wrangler deploy --dry-run --outdir`,
+	 * this is ~270 ESM modules. Single-file Workers can pass a
+	 * one-element array.
+	 */
+	modules: ScriptModule[];
+	/**
+	 * Name of the module to use as the script entry. Must be one of
+	 * `modules[].name`. Embedded in the metadata as `main_module`.
+	 */
+	mainModule: string;
 	/** Bindings injected at the script's `env`. */
 	bindings: WorkerBinding[];
 	/** Compatibility date (e.g. "2026-05-01"). */
@@ -83,7 +114,7 @@ export interface NamespaceScriptUploadInput {
 	compatibilityFlags?: string[];
 	/**
 	 * Optional tags — WfP uses these for fleet-wide management
-	 * (filtering, bulk operations). Useful later for things like
+	 * (filtering, bulk operations). Useful for things like
 	 * "find all tenants pinned to EmDash 0.14".
 	 */
 	tags?: string[];
@@ -210,16 +241,28 @@ export class CloudflareApi {
 	}
 
 	/**
-	 * Upload a user Worker into a dispatch namespace. Single-module
-	 * ES Modules format (multipart, metadata declares the main module).
+	 * Upload a user Worker into a dispatch namespace.
 	 *
-	 * This is the per-tenant call: each creator gets one namespace
-	 * script with their own D1 + R2 bindings.
+	 * Sends each module as its own multipart form part. Metadata
+	 * declares `main_module` (one of the module names) plus bindings,
+	 * compatibility settings, and optional tags. Caller is responsible
+	 * for ensuring `mainModule` references a module present in
+	 * `modules` — we validate that upfront with a clear error.
 	 */
 	async uploadNamespaceScript(input: NamespaceScriptUploadInput): Promise<null> {
+		if (input.modules.length === 0) {
+			throw new Error("uploadNamespaceScript: `modules` cannot be empty.");
+		}
+		const moduleNames = new Set(input.modules.map((m) => m.name));
+		if (!moduleNames.has(input.mainModule)) {
+			throw new Error(
+				`uploadNamespaceScript: \`mainModule\` "${input.mainModule}" is not in the modules list (have: ${[...moduleNames].slice(0, 5).join(", ")}${moduleNames.size > 5 ? ", ..." : ""}).`,
+			);
+		}
+
 		const form = new FormData();
 		const metadata = {
-			main_module: "worker.js",
+			main_module: input.mainModule,
 			compatibility_date: input.compatibilityDate,
 			compatibility_flags: input.compatibilityFlags ?? [],
 			bindings: input.bindings,
@@ -229,11 +272,18 @@ export class CloudflareApi {
 			"metadata",
 			new Blob([JSON.stringify(metadata)], { type: "application/json" }),
 		);
-		form.append(
-			"worker.js",
-			new Blob([input.scriptBody], { type: "application/javascript+module" }),
-			"worker.js",
-		);
+		for (const mod of input.modules) {
+			const ct = mod.contentType ?? "application/javascript+module";
+			// Cast through `BlobPart`: `Uint8Array<ArrayBufferLike>`
+			// isn't assignable to `BlobPart` under strict TS even
+			// though it's valid at runtime — the union of ArrayBuffer
+			// and SharedArrayBuffer is the upstream type wart.
+			form.append(
+				mod.name,
+				new Blob([mod.body as BlobPart], { type: ct }),
+				mod.name,
+			);
+		}
 		return this.request<null>(
 			"PUT",
 			`/accounts/${this.accountId}/workers/dispatch/namespaces/${encodeURIComponent(input.namespace)}/scripts/${encodeURIComponent(input.scriptName)}`,

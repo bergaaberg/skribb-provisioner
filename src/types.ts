@@ -29,6 +29,19 @@ export interface TenantResources {
 	r2BucketName?: string;
 	/** Script name inside the dispatch namespace (e.g. "skribb-cms-alice"). */
 	scriptName?: string;
+	/**
+	 * EmDash version of the bundle currently deployed. Updated on
+	 * every `script_uploaded` step (provision) and every successful
+	 * `bumpTenant` call. Used to filter batch fanout operations
+	 * without hitting the CF API to inspect script tags.
+	 */
+	currentEmdashVersion?: string;
+	/**
+	 * Git short SHA of the currently-deployed bundle. Same lifecycle
+	 * as `currentEmdashVersion`. The combination of these two fields
+	 * identifies exactly which bundle the tenant is running.
+	 */
+	currentBundleSha?: string;
 }
 
 export interface TenantRecord {
@@ -63,17 +76,30 @@ export interface TenantStore {
 }
 
 /**
- * Loads the pre-built skribb-cms Worker bundle. Production impl fetches a
- * tarball from R2 or a registry; test impl returns a stub string. Pulling
- * this out as a dependency keeps the orchestrator free of file IO.
+ * Loads the pre-built skribb-cms Worker bundle. Production impl fetches
+ * a tarball from R2 keyed by emdash version + git sha (see
+ * `bergaaberg/skribb-cms/BUNDLE.md`); test impl returns a stub array.
+ *
+ * The returned `modules` array carries every `.mjs` file in the bundle.
+ * For Astro+Cloudflare builds via `wrangler deploy --dry-run --outdir`,
+ * this is ~270 modules at EmDash 0.14. `mainModule` is the entrypoint
+ * name (`"entry.mjs"` for Astro).
  */
 export interface BundleLoader {
 	load(): Promise<{
-		scriptBody: string;
+		modules: import("./cloudflare-api.js").ScriptModule[];
+		mainModule: string;
 		compatibilityDate: string;
 		compatibilityFlags?: string[];
 		/** EmDash version this bundle ships with — recorded as a tag on the namespace script. */
 		emdashVersion?: string;
+		/**
+		 * Git short SHA of the skribb-cms commit that produced this
+		 * bundle. Recorded as a tag so we can identify which bundle a
+		 * tenant is running and target specific versions for bump
+		 * fanout.
+		 */
+		gitShortSha?: string;
 	}>;
 }
 
