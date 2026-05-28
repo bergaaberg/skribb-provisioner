@@ -78,14 +78,25 @@ export interface BundleLoader {
 }
 
 /**
- * Bootstraps a freshly-deployed tenant: runs EmDash migrations and
- * creates the initial admin user. Implementation calls into the
- * deployed Worker's `/_skribb/provision` endpoint with a one-time
- * provisioning token (also injected as a binding at upload time).
+ * Bootstraps a freshly-deployed tenant.
  *
- * The hostname passed in is the customer-facing host; the dispatcher
- * Worker routes it to the right namespace member, so the bootstrap
- * client doesn't need to know about WfP internals.
+ * The platform-side implementation does this as **two HTTP calls in
+ * order** against the customer-facing hostname (the dispatcher Worker
+ * routes both into the right namespace member):
+ *
+ *   1. `POST /_emdash/api/setup`
+ *      body: { title, tagline: "", includeContent: false }
+ *      no auth — EmDash self-locks once setup completes.
+ *      Runs migrations + applies seed.
+ *
+ *   2. `POST /skribb/provision`
+ *      body: { adminEmail, adminName? }
+ *      auth: `Authorization: Bearer <provisioningToken>`.
+ *      Creates the initial admin user.
+ *
+ * The two-call shape is forced by EmDash's middleware: it redirects
+ * un-migrated requests for non-`/_emdash/*` routes to `/admin/setup`,
+ * which means `/skribb/provision` can't bootstrap migrations itself.
  *
  * Split from the orchestrator so tests can replace it with a no-op.
  */
@@ -94,6 +105,12 @@ export interface BootstrapClient {
 		hostname: string;
 		provisioningToken: string;
 		adminEmail: string;
+		/**
+		 * Display title passed to EmDash's setup endpoint as the initial
+		 * site title (becomes the publication's name in the admin UI).
+		 * Typically the creator's display name or their handle.
+		 */
+		title: string;
 	}): Promise<void>;
 }
 
@@ -104,6 +121,13 @@ export interface ProvisionInput {
 	handle: string;
 	/** Validated email. */
 	email: string;
+	/**
+	 * Display title for the publication — passed to EmDash's setup
+	 * step as the initial site title. Optional; defaults to the
+	 * handle (so a creator who chose `alice` gets a site titled
+	 * "alice" until they edit it in the admin).
+	 */
+	title?: string;
 }
 
 export interface ProvisionConfig {

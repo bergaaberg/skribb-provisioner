@@ -125,8 +125,25 @@ describe("provisionTenant — happy path", () => {
 				hostname: "alice.cms.skribb.no",
 				provisioningToken: "test-token-32-bytes-hex",
 				adminEmail: "alice@example.com",
+				// Defaults to the handle when not provided.
+				title: "alice",
 			},
 		]);
+	});
+
+	it("passes an explicit title to bootstrap when provided", async () => {
+		const cf = makeMockCloudflareApi();
+		const store = makeInMemoryStore();
+		const bundle = makeStubBundle();
+		const bootstrap = makeMockBootstrap();
+
+		await provisionTenant(
+			{ cf: cf.api, store, bundle, bootstrap },
+			{ ...input, title: "Alice's Letters" },
+			config,
+		);
+
+		expect(bootstrap.calls[0]?.title).toBe("Alice's Letters");
 	});
 
 	it("does NOT touch domain binding or namespace creation (per-tenant)", async () => {

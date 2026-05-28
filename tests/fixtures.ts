@@ -209,7 +209,12 @@ export function makeStubBundle(
 }
 
 export interface MockBootstrap extends BootstrapClient {
-	calls: Array<{ hostname: string; provisioningToken: string; adminEmail: string }>;
+	calls: Array<{
+		hostname: string;
+		provisioningToken: string;
+		adminEmail: string;
+		title: string;
+	}>;
 }
 
 export function makeMockBootstrap(failNext?: string): MockBootstrap {

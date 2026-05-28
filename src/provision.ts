@@ -202,6 +202,7 @@ export async function provisionTenant(
 			hostname,
 			provisioningToken,
 			adminEmail: input.email,
+			title: input.title ?? input.handle,
 		});
 		return {};
 	});

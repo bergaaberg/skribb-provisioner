@@ -77,7 +77,7 @@ const result = await provisionTenant(
     bundle: bundleFromR2(env.CMS_ARTIFACTS),
     bootstrap: httpsBootstrapClient(),
   },
-  { creatorId, handle, email },
+  { creatorId, handle, email, title: "Alice's Letters" },
   {
     cmsBaseDomain: "cms.skribb.no",
     dispatchNamespace: "skribb-tenants",
@@ -87,6 +87,9 @@ const result = await provisionTenant(
 
 Returns a `TenantRecord` whose `step` field will be either `"ready"`
 (success) or `"failed"` (caller catches the error and surfaces it).
+`title` is optional; defaults to the handle when omitted (so a
+creator who chose `alice` gets a site titled `"alice"` until they
+edit it in the admin).
 
 State machine: `reserved → d1_created → r2_created → script_uploaded → bootstrapped → ready`.
 
@@ -123,12 +126,12 @@ import { CloudflareApi, provisionTenant } from "@skribb/provisioner";
 import { kyselyTenantStore, bundleFromR2, httpsBootstrap } from "./adapters";
 
 export async function POST(req: Request) {
-  const { handle, email } = parseAndValidate(await req.formData());
+  const { handle, email, title } = parseAndValidate(await req.formData());
   const creatorId = ulid();
 
   // 1. Reserve in skribb's own DB
   await env.DB.insertInto("writers")
-    .values({ id: creatorId, handle, email, cms_status: "provisioning" })
+    .values({ id: creatorId, handle, email, title, cms_status: "provisioning" })
     .execute();
 
   // 2. Provision the EmDash instance behind the dispatcher
@@ -143,7 +146,7 @@ export async function POST(req: Request) {
         bundle: bundleFromR2(env.CMS_ARTIFACTS),
         bootstrap: httpsBootstrap(),
       },
-      { creatorId, handle, email },
+      { creatorId, handle, email, title },
       { cmsBaseDomain: "cms.skribb.no", dispatchNamespace: "skribb-tenants" },
     );
     await env.DB.updateTable("writers")
